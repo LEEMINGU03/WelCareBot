@@ -1,0 +1,15 @@
+[project]
+name = "agent-a-to-z"
+version = "0.1.0"
+description = "탄탄한 AI 에이전트 A to Z"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "crewai[tools]==0.177.0",
+    "dotenv>=0.9.9",
+    "python-telegram-bot>=22.3",
+    "firecrawl-py==3.4.0",
+    "langgraph==0.6.7",
+    "langchain-openai==0.2.14",
+    "langchain-community==0.3.29",
+]
