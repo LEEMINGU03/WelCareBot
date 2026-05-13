@@ -1,7 +1,7 @@
 from pathlib import Path
 from crewai import Agent, Crew, Process, Task
 from crewai.project import CrewBase, agent, task, crew
-from crewai_tools import SerperDevTool, ScrapeWebsiteTool
+from crewai_tools import SerperDevTool
 
 _CONFIG = Path(__file__).parent.parent / "config"
 
@@ -15,7 +15,7 @@ class PolicySearchCrew:
     def policy_researcher_agent(self) -> Agent:
         return Agent(
             config=self.agents_config["policy_researcher_agent"],  # type: ignore
-            tools=[SerperDevTool(), ScrapeWebsiteTool()],
+            tools=[SerperDevTool()],
         )
 
     @task

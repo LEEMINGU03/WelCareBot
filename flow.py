@@ -2,85 +2,241 @@ import json
 import re
 from typing import Any, List
 from pydantic import BaseModel
-from crewai.flow.flow import Flow, listen, start, router, or_
+from crewai.flow.flow import Flow, listen, start, router
 
+from crewai_tools import ScrapeWebsiteTool
 from crews.intake_crew import IntakeCrew
 from crews.policy_crew import PolicySearchCrew
-from crews.translator_crew import TranslatorCrew
+from crews.eligibility_crew import EligibilityCrew
 
 
 class WelCareState(BaseModel):
     message: str = ""
     history: List[str] = []
+    phase: str = "intake"          # intake | search | selection | eligibility | done
     conditions: dict[str, Any] = {}
-    follow_up: str = ""
-    status: str = "INCOMPLETE"
+    policies: List[dict] = []
+    selected_policy: dict = {}
     result: str = ""
 
 
 def _parse_json(raw: str) -> dict[str, Any]:
-    """코드 펜스·thinking 텍스트·이중 중괄호를 모두 처리해 JSON만 추출해 파싱."""
-    # 1) 코드 펜스 제거
     cleaned = re.sub(r"```(?:json)?\s*", "", raw).replace("```", "").strip()
-    # 2) 앞뒤 thinking 텍스트 무시 — 첫 { 부터 마지막 } 까지만 추출
-    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-    text = match.group() if match else cleaned
-    # 3) 정상 파싱 먼저 시도
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-    # 4) LLM이 Jinja2 이스케이프({{ }})를 그대로 출력한 경우 변환 후 재시도
-    text = text.replace("{{", "{").replace("}}", "}")
-    return json.loads(text)
+
+    # 모든 최상위 {...} 블록을 추출
+    candidates: list[str] = []
+    depth = 0
+    start = -1
+    for i, ch in enumerate(cleaned):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start != -1:
+                candidates.append(cleaned[start : i + 1])
+                start = -1
+
+    # LLM 실제 출력은 마지막 블록에 있으므로 역순으로 시도
+    for candidate in reversed(candidates):
+        for text in (candidate, candidate.replace("{{", "{").replace("}}", "}")):
+            try:
+                result = json.loads(text)
+                if isinstance(result, dict):
+                    return result
+            except json.JSONDecodeError:
+                pass
+
+    raise json.JSONDecodeError("No valid JSON dict found", cleaned, 0)
+
+
+def _find_policy(message: str, policies: list[dict]) -> dict | None:
+    """번호(숫자/한국어) 또는 이름 텍스트로 정책 매칭."""
+    msg = message.strip()
+
+    # 숫자 직접 입력: "1", "2", ...
+    if msg.isdigit():
+        idx = int(msg) - 1
+        if 0 <= idx < len(policies):
+            return policies[idx]
+
+    # 한국어 수 표현
+    kr_nums = {
+        "첫 번째": 0, "하나": 0, "1번": 0,
+        "두 번째": 1, "둘": 1, "2번": 1,
+        "세 번째": 2, "셋": 2, "3번": 2,
+        "네 번째": 3, "넷": 3, "4번": 3,
+        "다섯 번째": 4, "다섯": 4, "5번": 4,
+    }
+    for word, idx in kr_nums.items():
+        if word in msg and idx < len(policies):
+            return policies[idx]
+
+    # 정책명 포함 검색
+    msg_lower = msg.lower()
+    for policy in policies:
+        name = policy.get("name", "").lower()
+        if name and (name in msg_lower or msg_lower in name):
+            return policy
+
+    # 단어 단위 부분 매칭
+    for policy in policies:
+        words = [w for w in policy.get("name", "").split() if len(w) > 1]
+        if any(w in msg for w in words):
+            return policy
+
+    return None
+
+
+def _format_policy_list(policies: list[dict]) -> str:
+    lines = [
+        "아래 복지 정책을 찾았어요!",
+        "**번호** 또는 **이름**으로 더 알고 싶은 항목을 선택해주세요.\n",
+    ]
+    for i, p in enumerate(policies, 1):
+        benefit = p.get("benefit", "")
+        preview = benefit[:60] + ("..." if len(benefit) > 60 else "")
+        lines.append(f"**{i}. {p.get('name', '')}**")
+        lines.append(f"   {preview}")
+        lines.append("")
+    lines.append('예) `2` 또는 `청년 월세 지원`')
+    return "\n".join(lines)
 
 
 class WelCareFlow(Flow[WelCareState]):
 
     @start()
+    def dispatch(self):
+        pass
+
+    @router(dispatch)
+    def route_phase(self):
+        return self.state.phase
+
+    # ── Phase 1: Intake (3가지 기본 정보 수집) ──────────────────
+    @listen("intake")
     def run_intake(self):
         intake_result = IntakeCrew().crew().kickoff(inputs={
             "message": self.state.message,
             "history": "\n".join(self.state.history) if self.state.history else "없음",
         })
-
-        data: dict[str, Any]
         try:
             data = _parse_json(intake_result.raw)
-        except (json.JSONDecodeError, AttributeError, ValueError):
+        except Exception:
             data = {"status": "INCOMPLETE", "follow_up_question": str(intake_result.raw)}
 
-        self.state.status = data.get("status", "INCOMPLETE")
-
-        if self.state.status == "INCOMPLETE":
-            self.state.follow_up = data.get("follow_up_question", "추가 정보가 필요합니다.")
+        if data.get("status", "").upper() == "COMPLETE":
+            raw = data.get("conditions")
+            self.state.conditions = raw if isinstance(raw, dict) else {}
+            self.state.phase = "search"
         else:
-            self.state.conditions = data.get("conditions", {})
+            self.state.result = data.get("follow_up_question", "조금 더 알려주실 수 있을까요?")
 
     @router(run_intake)
-    def check_status(self):
-        if self.state.status == "COMPLETE":
-            return "search_via_intake"
-        return "ask_followup"
+    def after_intake(self):
+        return "do_search" if self.state.phase == "search" else "end_turn"
 
-    @listen("ask_followup")
-    def ask_user(self):
-        self.state.result = self.state.follow_up
-
-    # or_ : "search_via_intake" (일반 경로) 또는
-    #        "direct_search"     (나중에 조건을 직접 주입하는 경로 확장용)
-    @listen(or_("search_via_intake", "direct_search"))
-    def search_policies(self):
+    # ── Phase 2: 검색 → 3~5개 목록 제시 ─────────────────────────
+    @listen("do_search")
+    def search_and_present(self):
         policy_result = PolicySearchCrew().crew().kickoff(inputs={
             "conditions": json.dumps(self.state.conditions, ensure_ascii=False),
         })
-        # 코드 펜스 제거 후 저장 (translator가 받는 원문 정리)
-        cleaned = re.sub(r"```(?:json)?\s*", "", policy_result.raw).replace("```", "").strip()
-        self.state.result = cleaned
+        try:
+            cleaned = re.sub(r"```(?:json)?\s*", "", policy_result.raw).replace("```", "").strip()
+            data = _parse_json(cleaned)
+            self.state.policies = data.get("policies", [])[:5]
+        except Exception:
+            self.state.policies = []
 
-    @listen(search_policies)
-    def translate_result(self):
-        translated = TranslatorCrew().crew().kickoff(inputs={
-            "policy_result": self.state.result,
+        if not self.state.policies:
+            self.state.result = "죄송해요, 조건에 맞는 정책을 찾지 못했어요. 다시 말씀해주세요."
+            self.state.phase = "intake"
+            return
+
+        self.state.result = _format_policy_list(self.state.policies)
+        self.state.phase = "selection"
+
+    # ── Phase 3: 선택 (번호 또는 텍스트) ──────────────────────────
+    @listen("selection")
+    def handle_selection(self):
+        policy = _find_policy(self.state.message, self.state.policies)
+
+        if policy is None:
+            self.state.result = (
+                "어떤 정책을 원하시는지 잘 모르겠어요. "
+                "번호나 이름으로 다시 선택해주세요.\n\n"
+                + _format_policy_list(self.state.policies)
+            )
+            return  # phase stays "selection"
+
+        self.state.selected_policy = policy
+        self.state.phase = "eligibility"
+
+        # 선택된 정책 URL만 크롤링해서 상세 정보 보강
+        url = policy.get("url", "")
+        if url:
+            try:
+                detail = ScrapeWebsiteTool()._run(website_url=url)
+                policy = {**policy, "detail": str(detail)[:3000]}
+                self.state.selected_policy = policy
+            except Exception:
+                pass
+
+        # 선택 확인 + 첫 번째 자격 질문을 같은 turn에 제공
+        elig_result = EligibilityCrew().crew().kickoff(inputs={
+            "policy_json": json.dumps(policy, ensure_ascii=False),
+            "history": "없음",
+            "message": "시작해주세요",
         })
-        self.state.result = translated.raw
+        try:
+            data = _parse_json(elig_result.raw)
+            first_question = data.get("message", "자격 조건을 확인해볼게요!")
+        except Exception:
+            first_question = str(elig_result.raw)
+
+        self.state.result = (
+            f"**{policy.get('name', '')}**를 선택하셨군요! "
+            f"자격 조건을 함께 확인해볼게요.\n\n"
+            f"{first_question}"
+        )
+
+    # ── Phase 4: 자격 확인 대화 ───────────────────────────────────
+    @listen("eligibility")
+    def check_eligibility(self):
+        elig_result = EligibilityCrew().crew().kickoff(inputs={
+            "policy_json": json.dumps(self.state.selected_policy, ensure_ascii=False),
+            "history": "\n".join(self.state.history) if self.state.history else "없음",
+            "message": self.state.message,
+        })
+        try:
+            data = _parse_json(elig_result.raw)
+        except Exception:
+            data = {"status": "INCOMPLETE", "message": str(elig_result.raw)}
+
+        status = data.get("status", "INCOMPLETE").upper()
+
+        if status == "ELIGIBLE":
+            p = self.state.selected_policy
+            self.state.result = (
+                f"✅ **신청 가능합니다!**\n\n"
+                f"**{p.get('name', '')}**\n\n"
+                f"**신청 방법:** {p.get('how_to_apply', '')}\n\n"
+                f"**마감일:** {p.get('deadline', '상시 접수')}\n\n"
+                f"[더 알아보기 →]({p.get('url', '')})"
+            )
+            self.state.phase = "done"
+
+        elif status == "NOT_ELIGIBLE" or status == "NOT ELIGIBLE":
+            reason = data.get("reason", "")
+            self.state.result = (
+                f"😔 **아쉽게도 해당 정책은 신청이 어렵습니다.**\n\n"
+                f"{reason}\n\n---\n\n"
+                f"다른 정책을 확인해볼까요?\n\n"
+                + _format_policy_list(self.state.policies)
+            )
+            self.state.phase = "selection"
+
+        else:
+            self.state.result = data.get("message", "")
