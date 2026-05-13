@@ -37,6 +37,7 @@ class ChatState(BaseModel):
     policies: list[dict] = [] ## 검색 결과로 나온 복지 정책 목록
     selected_policy: dict[str, Any] = {} ## 사용자가 목록에서 선택한 정책(1개)
     conditions: dict[str, Any] = {}  ## 사용자 개인 정보
+    lang: str = "ko"  ## 응답 언어 코드 (ko, en, ja, zh ...)
 
 
 class ChatRequest(BaseModel):
