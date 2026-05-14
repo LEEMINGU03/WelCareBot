@@ -1,7 +1,7 @@
 # WelCare — 복지 정책 매칭 챗봇
 
-CrewAI Flow 기반의 3-Agent 복지 정책 안내 시스템입니다.
-사용자와 대화로 조건을 수집하고, 실시간 웹 검색으로 정책을 찾은 뒤, 행정 용어를 쉬운 말로 풀어서 전달합니다.
+CrewAI Flow 기반의 4-Phase 복지 정책 안내 시스템입니다.
+사용자와 대화로 조건을 수집하고, 실시간 웹 검색으로 정책 목록을 제시한 뒤, 선택한 정책의 자격 조건을 단계별로 확인합니다.
 
 ---
 
@@ -11,19 +11,48 @@ CrewAI Flow 기반의 3-Agent 복지 정책 안내 시스템입니다.
 사용자 입력
     │
     ▼
-┌──────────────────────────────────────────┐
-│  WelCareFlow  (flow.py)                  │
-│                                          │
-│  @start   run_intake()                   │  ← IntakeCrew
-│      │                                   │
-│  @router  check_status()                 │  ← INCOMPLETE / COMPLETE 분기
-│      │                  │                │
-│  ask_user()        search_policies()     │  ← PolicySearchCrew
-│  (역질문 반환)           │               │
-│                   translate_result()     │  ← TranslatorCrew
-│                   (쉬운 말로 최종 출력)  │
-└──────────────────────────────────────────┘
+┌────────────────────────────────────────────────┐
+│  WelCareFlow  (flow.py)                        │
+│                                                │
+│  @start   dispatch()                           │
+│      │                                         │
+│  @router  route_phase()   ← phase 값으로 분기  │
+│      │                                         │
+│  "intake"      run_intake()      ← IntakeCrew  │
+│      │                                         │
+│  @router  after_intake()                       │
+│      │               │                         │
+│  end_turn      "do_search"                     │
+│  (역질문 반환)       │                         │
+│            search_and_present() ← PolicySearchCrew │
+│                      │                         │
+│               "selection"                      │
+│            handle_selection()                  │
+│            (번호/이름으로 정책 선택)            │
+│                      │                         │
+│               "eligibility"                    │
+│            check_eligibility() ← EligibilityCrew  │
+│            (자격 조건 1개씩 확인)               │
+│                      │                         │
+│                   "done"                       │
+│            신청 방법 + URL 안내                 │
+└────────────────────────────────────────────────┘
 ```
+
+---
+
+## 상태 (WelCareState)
+
+| 필드 | 타입 | 설명 |
+|------|------|------|
+| `message` | str | 사용자 최근 메시지 |
+| `history` | List[str] | 대화 이력 |
+| `phase` | str | 현재 단계 (`intake` \| `search` \| `selection` \| `eligibility` \| `done`) |
+| `conditions` | dict | 수집된 복지 검색 조건 |
+| `policies` | List[dict] | 검색된 정책 목록 |
+| `selected_policy` | dict | 사용자가 선택한 정책 |
+| `result` | str | 사용자에게 반환할 응답 텍스트 |
+| `lang` | str | 응답 언어 코드 (기본값: `"ko"`) |
 
 ---
 
@@ -34,35 +63,62 @@ CrewAI Flow 기반의 3-Agent 복지 정책 안내 시스템입니다.
 | 항목 | 내용 |
 |------|------|
 | **위치** | `crews/intake_crew.py` |
-| **역할** | 사용자와 대화하며 복지 매칭에 필요한 정보 수집 |
+| **역할** | 대분류→소분류→지역→나이 순으로 4단계 수집 |
 | **도구** | 없음 (대화 전용) |
-| **동작** | 나이·가구수·월소득·장애 여부·거주 지역 등 누락 정보가 있으면 역질문(Slot Filling) 생성. 모든 조건이 갖춰지면 `status: COMPLETE` 반환 |
+| **LLM** | `gemini/gemini-2.5-flash` |
+
+**수집 단계**
+1. **대분류** — 주거 / 취업·일자리 / 의료·건강 / 교육 / 생계·소득 / 육아·가족 / 노인 / 장애인 / 청년
+2. **소분류** — 대분류에 해당하는 세부 항목 (자유 텍스트 입력도 허용)
+3. **지역 & 나이** — 한 번에 수집
 
 **출력 형식 (JSON)**
 ```json
 {
   "status": "INCOMPLETE | COMPLETE",
-  "follow_up_question": "추가 질문 (INCOMPLETE 시)",
+  "follow_up_question": "다음 질문 (INCOMPLETE일 때만)",
   "conditions": {
-    "age": "나이",
-    "household_size": "가구수",
-    "monthly_income": "월소득",
-    "disability": "장애 여부",
-    "region": "거주 지역"
+    "welfare_type_major": "대분류",
+    "welfare_type_minor": "소분류",
+    "region": "거주 지역",
+    "age": "나이"
   }
 }
 ```
 
 ---
 
-### 2. `policy_researcher_agent` — 복지 정책 검색 전문가
+### 2. `eligibility_agent` — 복지 자격 확인 전문가
+
+| 항목 | 내용 |
+|------|------|
+| **위치** | `crews/eligibility_crew.py` |
+| **역할** | 선택된 정책의 자격 조건을 1개씩 대화로 확인 |
+| **도구** | 없음 (대화 전용) |
+| **LLM** | `gemini/gemini-2.5-flash` |
+
+**출력 형식 (JSON)**
+```json
+{
+  "status": "ELIGIBLE | NOT_ELIGIBLE | INCOMPLETE",
+  "message": "다음 질문 또는 확인 메시지",
+  "reason": "판단 이유 (ELIGIBLE/NOT_ELIGIBLE일 때)"
+}
+```
+
+---
+
+### 3. `policy_researcher_agent` — 복지 정책 검색 전문가
 
 | 항목 | 내용 |
 |------|------|
 | **위치** | `crews/policy_crew.py` |
-| **역할** | 수집된 조건으로 실시간 웹 검색 후 맞춤 정책 제공 |
-| **도구** | `SerperDevTool` (웹 검색), `ScrapeWebsiteTool` (크롤링) |
-| **동작** | 복지로·고용노동부·지자체 사이트 검색 → 조건 부합 정책 최대 5개 선별 |
+| **역할** | 수집된 조건으로 실시간 웹 검색 후 맞춤 정책 최대 3개 제공 |
+| **도구** | `SerperDevTool` (웹 검색) |
+| **LLM** | `gemini/gemini-2.5-flash` |
+
+검색 범위는 **구/군(기초자치단체) → 시/도 → 전국** 순으로 확장 가능하며, 사용자가 목록에서 A/B 버튼으로 범위를 넓힐 수 있습니다.
+선택된 정책의 URL은 `flow.py`에서 `ScrapeWebsiteTool`로 직접 크롤링하여 상세 정보를 보강합니다.
 
 **출력 형식 (JSON)**
 ```json
@@ -75,7 +131,7 @@ CrewAI Flow 기반의 3-Agent 복지 정책 안내 시스템입니다.
       "eligibility": "수혜 자격",
       "how_to_apply": "신청 방법",
       "deadline": "마감일",
-      "url": "링크"
+      "url": "URL (없으면 빈 문자열)"
     }
   ]
 }
@@ -83,33 +139,9 @@ CrewAI Flow 기반의 3-Agent 복지 정책 안내 시스템입니다.
 
 ---
 
-### 3. `translator_agent` — 쉬운 말 번역가
+### 4. `translator_agent` — 쉬운 말 번역가 *(현재 미사용)*
 
-| 항목 | 내용 |
-|------|------|
-| **위치** | `crews/translator_crew.py` |
-| **역할** | 정책 검색 결과의 행정 용어를 초등학생 수준의 쉬운 우리말로 순화 |
-| **도구** | 없음 (텍스트 변환 전용) |
-| **동작** | `policy_researcher_agent` 출력을 받아 용어만 바꿈. 정책명·금액·자격 조건 등 원래 내용은 절대 변경하지 않음 |
-
-**용어 순화 예시**
-
-| 행정 용어 | 쉬운 말 |
-|-----------|---------|
-| 소득인정액 | 가정의 실제 수입으로 인정되는 금액 |
-| 부양의무자 | 부모님이나 자녀 |
-| 차상위계층 | 기초생활수급자 바로 위 소득 계층 |
-| 수급자 | 나라에서 돈을 받는 사람 |
-
-**출력 형식 (사용자에게 바로 보여주는 텍스트)**
-```
-1. 정책 이름
-- 어떤 도움인가요? : ...
-- 누가 받을 수 있나요? : ...
-- 어떻게 신청하나요? : ...
-- 언제까지 신청하나요? : ...
-- 더 알아보기 : URL
-```
+행정 용어를 쉬운 우리말로 순화하는 에이전트입니다. `config/agents.yaml`과 `crews/translator_crew.py`에 정의되어 있으나 현재 Flow에서는 사용되지 않습니다.
 
 ---
 
@@ -118,20 +150,29 @@ CrewAI Flow 기반의 3-Agent 복지 정책 안내 시스템입니다.
 ```
 flow.kickoff(inputs)
     │
-    ├─ @start()   run_intake()              # IntakeCrew 실행
+    ├─ @start      dispatch()            # 진입점 (아무 동작 없음)
     │
-    ├─ @router    check_status()            # INCOMPLETE / COMPLETE 분기
-    │       │
-    │  "ask_followup"    "search_via_intake"
-    │       │                  │
-    │  ask_user()         search_policies() # or_("search_via_intake", "direct_search")
-    │  역질문 반환              │             PolicySearchCrew 실행
-    │                    translate_result() # @listen(search_policies)
-    │                    쉬운 말 변환        TranslatorCrew 실행
-    │                    → state.result 최종 저장
+    ├─ @router     route_phase()         # state.phase 값으로 분기
+    │
+    ├─ "intake"    run_intake()          # IntakeCrew 실행
+    │                  │
+    │              after_intake()        # @router: "do_search" or "end_turn"
+    │                  │
+    ├─ "do_search" search_and_present()  # PolicySearchCrew → 정책 목록 제시
+    │                  │                # state.phase = "selection"
+    │
+    ├─ "selection" handle_selection()   # 번호/이름으로 정책 선택
+    │                  │                # A → 시/도 확장 검색
+    │                  │                # B → 전국 확장 검색
+    │                  │                # 선택 → URL 크롤링 + EligibilityCrew 첫 질문
+    │                  │                # state.phase = "eligibility"
+    │
+    └─ "eligibility" check_eligibility() # EligibilityCrew 실행
+                       │
+              ELIGIBLE → 신청 안내 + state.phase = "done"
+              NOT_ELIGIBLE → 다른 정책 목록으로 복귀 (state.phase = "selection")
+              INCOMPLETE → 다음 자격 질문 반환
 ```
-
-> `or_("search_via_intake", "direct_search")` — 추후 조건을 직접 주입하는 경로(예: Telegram 버튼) 확장용.
 
 ---
 
@@ -142,13 +183,15 @@ WelCare/
 ├── crews/
 │   ├── __init__.py
 │   ├── intake_crew.py        # IntakeCrew       (intake_agent)
+│   ├── eligibility_crew.py   # EligibilityCrew  (eligibility_agent)
 │   ├── policy_crew.py        # PolicySearchCrew (policy_researcher_agent)
-│   └── translator_crew.py    # TranslatorCrew   (translator_agent)
+│   └── translator_crew.py    # TranslatorCrew   (미사용)
 ├── config/
 │   ├── agents.yaml           # agent role / goal / backstory
 │   └── tasks.yaml            # task description / expected_output
 ├── flow.py                   # WelCareFlow (Flow 오케스트레이션)
-├── main.py                   # 진입점 + 대화 루프
+├── main.py                   # 진입점 + 터미널 대화 루프
+├── utils.py                  # parse_json 유틸리티
 ├── env.py                    # 환경변수 로딩
 └── .env                      # API 키 (git 제외)
 ```
@@ -158,10 +201,8 @@ WelCare/
 ## 환경 변수 (.env)
 
 ```
-TELEGRAM_BOT_TOKEN=...
 GEMINI_API_KEY=...
 SERPER_API_KEY=...
-FIRECRAWL_API_KEY=...
 ```
 
 ---
@@ -170,4 +211,6 @@ FIRECRAWL_API_KEY=...
 
 ```bash
 python main.py
+# 또는 초기 메시지를 인자로 전달
+python main.py 청년 주거 지원이 필요해요
 ```
