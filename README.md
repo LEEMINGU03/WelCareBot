@@ -190,9 +190,15 @@ WelCare/
 │   ├── agents.yaml           # agent role / goal / backstory
 │   └── tasks.yaml            # task description / expected_output
 ├── flow.py                   # WelCareFlow (Flow 오케스트레이션)
-├── main.py                   # 진입점 + 터미널 대화 루프
+├── flow_helpers.py           # region 파싱 / 정책 매칭 / 목록 포맷팅 유틸
+├── main.py                   # 터미널 대화 루프 + run_agent
+├── api.py                    # FastAPI 서버 (POST /chat)
 ├── utils.py                  # parse_json 유틸리티
 ├── env.py                    # 환경변수 로딩
+├── Dockerfile                # 컨테이너 이미지 빌드 (uv 기반)
+├── docker-compose.yml        # api + nginx 서비스 구성
+├── nginx.conf                # HTTPS 리버스 프록시 (bockji.duckdns.org)
+├── pyproject.toml / uv.lock  # 의존성 정의 (uv)
 └── .env                      # API 키 (git 제외)
 ```
 
@@ -209,8 +215,30 @@ SERPER_API_KEY=...
 
 ## 실행
 
+### 사전 준비
+
 ```bash
-python main.py
-# 또는 초기 메시지를 인자로 전달
-python main.py 청년 주거 지원이 필요해요
+# uv 설치 (최초 1회)
+pip install uv
+
+# 의존성 설치 (uv.lock 기반)
+uv sync
+```
+
+### 터미널 챗봇
+
+```bash
+uv run .\main.py
+```
+
+### API 서버 (FastAPI)
+
+```bash
+uv run uvicorn api:app --host 0.0.0.0 --port 8000
+```
+
+### Docker
+
+```bash
+docker compose up -d --build
 ```
