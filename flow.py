@@ -9,6 +9,11 @@ from crews.intake_crew import IntakeCrew
 from crews.policy_crew import PolicySearchCrew
 from crews.eligibility_crew import EligibilityCrew
 from utils import parse_json as _parse_json
+from flow_helpers import (
+    parse_region as _parse_region,
+    find_policy as _find_policy,
+    format_policy_list as _format_policy_list,
+)
 
 
 class WelCareState(BaseModel):
@@ -20,103 +25,6 @@ class WelCareState(BaseModel):
     selected_policy: dict = {}
     result: str = ""
     lang: str = "ko"               # 응답 언어 코드 (ko, en, ja, zh, ...)
-
-
-
-def _find_policy(message: str, policies: list[dict]) -> dict | None:
-    """번호(숫자/한국어) 또는 이름 텍스트로 정책 매칭."""
-    msg = message.strip()
-
-    # 숫자 직접 입력: "1", "2", ...
-    if msg.isdigit():
-        idx = int(msg) - 1
-        if 0 <= idx < len(policies):
-            return policies[idx]
-
-    # 한국어 수 표현
-    kr_nums = {
-        "첫 번째": 0, "하나": 0, "1번": 0,
-        "두 번째": 1, "둘": 1, "2번": 1,
-        "세 번째": 2, "셋": 2, "3번": 2,
-        "네 번째": 3, "넷": 3, "4번": 3,
-        "다섯 번째": 4, "다섯": 4, "5번": 4,
-    }
-    for word, idx in kr_nums.items():
-        if word in msg and idx < len(policies):
-            return policies[idx]
-
-    # 정책명 포함 검색
-    msg_lower = msg.lower()
-    for policy in policies:
-        name = policy.get("name", "").lower()
-        if name and (name in msg_lower or msg_lower in name):
-            return policy
-
-    # 단어 단위 부분 매칭
-    for policy in policies:
-        words = [w for w in policy.get("name", "").split() if len(w) > 1]
-        if any(w in msg for w in words):
-            return policy
-
-    return None
-
-
-def _format_policy_list(policies: list[dict], city: str = "") -> str:
-    lines = [
-        "아래 복지 정책을 찾았어요!",
-        "**번호** 또는 **이름**으로 더 알고 싶은 항목을 선택해주세요.\n",
-    ]
-
-    has_scope = any("scope" in p for p in policies)
-
-    if has_scope:
-        scope_order: list[str] = []
-        scope_groups: dict[str, list] = {}
-        for p in policies:
-            s = p.get("scope", "기타")
-            if s not in scope_groups:
-                scope_order.append(s)
-                scope_groups[s] = []
-            scope_groups[s].append(p)
-
-        icon_map: dict[str, str] = {"전국": "🇰🇷"}
-        non_national = [s for s in scope_order if s != "전국"]
-        for i, s in enumerate(non_national):
-            icon_map[s] = ("📍" if i == 0 else "🏙️")
-
-        counter = 1
-        for scope in scope_order:
-            lines.append(f"\n{icon_map.get(scope, '📌')} **{scope} 정책**\n")
-            for p in scope_groups[scope]:
-                benefit = p.get("benefit", "")
-                preview = benefit[:60] + ("..." if len(benefit) > 60 else "")
-                lines.append(f"**{counter}. {p.get('name', '')}**")
-                lines.append(f"   {preview}")
-                lines.append("")
-                counter += 1
-    else:
-        for i, p in enumerate(policies, 1):
-            benefit = p.get("benefit", "")
-            preview = benefit[:60] + ("..." if len(benefit) > 60 else "")
-            lines.append(f"**{i}. {p.get('name', '')}**")
-            lines.append(f"   {preview}")
-            lines.append("")
-
-    lines.append('예) `2` 또는 `청년 월세 지원`')
-
-    existing_scopes = {p.get("scope", "") for p in policies}
-    show_city = bool(city and city not in existing_scopes)
-    show_national = "전국" not in existing_scopes
-
-    if show_city or show_national:
-        lines.append("\n──────────────────────")
-        lines.append("다른 범위에서도 찾아드릴까요?")
-        if show_city:
-            lines.append(f"A. {city} 전체 정책 찾기")
-        if show_national:
-            lines.append("B. 전국 정책 찾기")
-
-    return "\n".join(lines)
 
 
 class WelCareFlow(Flow[WelCareState]):
@@ -157,9 +65,7 @@ class WelCareFlow(Flow[WelCareState]):
     @listen("do_search")
     def search_and_present(self):
         region = self.state.conditions.get("region", "")
-        parts = region.strip().split()
-        district = parts[-1] if len(parts) >= 2 else region
-        city = parts[0] if len(parts) >= 2 else ""
+        city, district = _parse_region(region)
         scope_desc = f"{district} 단위 기초자치단체 정책만" if city else f"{region} 단위 정책만"
 
         policy_result = PolicySearchCrew().crew().kickoff(inputs={
@@ -186,13 +92,36 @@ class WelCareFlow(Flow[WelCareState]):
         self.state.result = _format_policy_list(self.state.policies, city)
         self.state.phase = "selection"
 
+    def _expand_policy_search(
+        self,
+        search_region: str,
+        scope_desc: str,
+        scope_label: str,
+        city: str,
+    ) -> None:
+        """추가 범위 검색 → 결과를 state.policies에 누적하고 응답 포맷팅."""
+        result = PolicySearchCrew().crew().kickoff(inputs={
+            "conditions": json.dumps(self.state.conditions, ensure_ascii=False),
+            "search_region": search_region,
+            "scope": scope_desc,
+            "lang": self.state.lang,
+        })
+        try:
+            data = _parse_json(result.raw)
+            new_policies = data.get("policies", [])[:3]
+            for p in new_policies:
+                p["scope"] = scope_label
+            self.state.policies.extend(new_policies)
+        except Exception:
+            pass
+        self.state.result = _format_policy_list(self.state.policies, city)
+
     # ── Phase 3: 선택 (번호 또는 텍스트) ──────────────────────────
     @listen("selection")
     def handle_selection(self):
         msg = self.state.message.strip()
         region = self.state.conditions.get("region", "")
-        parts = region.strip().split()
-        city = parts[0] if len(parts) >= 2 else ""
+        city, _ = _parse_region(region)
         existing_scopes = {p.get("scope", "") for p in self.state.policies}
 
         # A: 시/도 전체 정책 요청
@@ -207,39 +136,21 @@ class WelCareFlow(Flow[WelCareState]):
         )
 
         if is_city_req:
-            result = PolicySearchCrew().crew().kickoff(inputs={
-                "conditions": json.dumps(self.state.conditions, ensure_ascii=False),
-                "search_region": city,
-                "scope": f"{city} 광역시/도 단위 정책만",
-                "lang": self.state.lang,
-            })
-            try:
-                data = _parse_json(result.raw)
-                new_policies = data.get("policies", [])[:3]
-                for p in new_policies:
-                    p["scope"] = city
-                self.state.policies.extend(new_policies)
-            except Exception:
-                pass
-            self.state.result = _format_policy_list(self.state.policies, city)
+            self._expand_policy_search(
+                search_region=city,
+                scope_desc=f"{city} 광역시/도 단위 정책만",
+                scope_label=city,
+                city=city,
+            )
             return
 
         if is_national_req:
-            result = PolicySearchCrew().crew().kickoff(inputs={
-                "conditions": json.dumps(self.state.conditions, ensure_ascii=False),
-                "search_region": "전국",
-                "scope": "전국 중앙정부 정책만",
-                "lang": self.state.lang,
-            })
-            try:
-                data = _parse_json(result.raw)
-                new_policies = data.get("policies", [])[:3]
-                for p in new_policies:
-                    p["scope"] = "전국"
-                self.state.policies.extend(new_policies)
-            except Exception:
-                pass
-            self.state.result = _format_policy_list(self.state.policies, city)
+            self._expand_policy_search(
+                search_region="전국",
+                scope_desc="전국 중앙정부 정책만",
+                scope_label="전국",
+                city=city,
+            )
             return
 
         policy = _find_policy(msg, self.state.policies)
@@ -314,7 +225,7 @@ class WelCareFlow(Flow[WelCareState]):
         elif status == "NOT_ELIGIBLE" or status == "NOT ELIGIBLE":
             reason = data.get("reason", "")
             region = self.state.conditions.get("region", "")
-            city = (region.strip().split() + [""])[0] if len(region.strip().split()) >= 2 else ""
+            city, _ = _parse_region(region)
             self.state.result = (
                 f"😔 **아쉽게도 해당 정책은 신청이 어렵습니다.**\n\n"
                 f"{reason}\n\n---\n\n"
