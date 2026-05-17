@@ -100,7 +100,7 @@ CrewAI Flow 기반의 4-Phase 복지 정책 안내 시스템입니다.
 **출력 형식 (JSON)**
 ```json
 {
-  "status": "ELIGIBLE | NOT_ELIGIBLE | INCOMPLETE",
+  "status": "ELIGIBLE(신청가능) | NOT_ELIGIBLE(신청 불가) | INCOMPLETE(심사 중)",
   "message": "다음 질문 또는 확인 메시지",
   "reason": "판단 이유 (ELIGIBLE/NOT_ELIGIBLE일 때)"
 }
